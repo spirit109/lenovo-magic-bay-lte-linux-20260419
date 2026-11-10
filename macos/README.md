@@ -27,6 +27,11 @@ cd macos
 
 构建目录中另有 `恢复家庭网络.app`，可在需要时停止 LTE 并尝试回到已保存的 Wi-Fi；它不能保证目标机器一定存在可用 Wi-Fi 或可用 DNS。更换现有联网组件之前，请先准备并实际验证可用的备用网络。历史诊断、修复和清洁安装辅助脚本可能绑定旧版本或特定维护场景，不能直接当作 0.2.6 的升级/降级工具。
 
+## 已知限制
+
+- 已观察到部分 USB 错误或发送超时会使 LTE 会话退出；驱动、设备、线缆和 Hub 供电等原因尚未完全区分。libusb 更新是否能改善长期稳定性仍需实机观察。
+- 在一台测试 Mac 上，VPN 补充 DNS 不响应时曾出现备用 Wi-Fi 直连解析失败；多个默认路由共存时也曾出现 LTE 路由接管校验失败。触发范围与其他机器的表现尚不明确，不能保证所有场景均能自动恢复。
+
 ## English quick start
 
 On an Apple Silicon Mac with macOS 14 or later, run the build commands above from the repository root. Open the generated app, expand its settings, and authorize installation of the network helper. Set the APN supplied by your carrier, then connect LTE. The current interface and detailed instructions are primarily Chinese. The app is ad-hoc signed and not notarized; builds and real-device behavior on other machines are not yet verified.
