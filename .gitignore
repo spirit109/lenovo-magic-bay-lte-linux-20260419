@@ -1,0 +1,6 @@
+# Local builds and synthetic test artifacts
+dist/
+__pycache__/
+*.py[cod]
+_RecycleBin/
+.DS_Store
