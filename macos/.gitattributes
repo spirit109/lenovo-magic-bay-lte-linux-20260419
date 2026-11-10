@@ -1,0 +1,8 @@
+* text=auto
+*.sh text eol=lf
+resources/install-helper text eol=lf
+*.swift text eol=lf
+*.c text eol=lf
+*.png binary
+*.icns binary
+*.bz2 binary

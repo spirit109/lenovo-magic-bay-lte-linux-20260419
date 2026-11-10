@@ -1,0 +1,94 @@
+#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+[ "$(uname -s)" = Darwin ] || { echo '此组件仅支持 macOS。' >&2; exit 69; }
+[ "$(id -u)" = 0 ] || { echo 'administrator_required' >&2; exit 77; }
+[ "$#" = 1 ] || { echo 'usage: install-helper USERNAME' >&2; exit 64; }
+target_user=$1
+case "$target_user" in ''|*[!A-Za-z0-9._-]*) echo 'invalid username' >&2; exit 64 ;; esac
+id "$target_user" >/dev/null
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+contents_dir=$(dirname -- "$script_dir")
+controller_source="$contents_dir/MacOS/magic-bay-lte-v2-rootctl"
+backend_source="$contents_dir/MacOS/mbim-net"
+companion_source="$contents_dir/MacOS/magicbay-proxy-compat"
+controller_target=/usr/local/sbin/magic-bay-lte-v2-rootctl
+base=/usr/local/libexec/magic-bay-lte-v2
+backend_target="$base/mbim-net"
+companion_target="$base/magicbay-proxy-compat"
+rule_target=/etc/sudoers.d/magic-bay-lte-v2
+
+if /bin/ps -axo comm= | /usr/bin/awk -v tool="$backend_target" '$0 == tool { found=1 } END { exit !found }'; then
+    echo '新版联网后台仍在运行，请先断开 LTE 后再更新组件。' >&2
+    exit 75
+fi
+for source_path in "$controller_source" "$backend_source" "$companion_source"; do
+    test -x "$source_path"
+    /usr/bin/codesign --verify --strict "$source_path"
+done
+if ! /usr/bin/grep -Eq '^[#@]includedir[[:space:]]+(/private)?/etc/sudoers\.d' /etc/sudoers; then
+    echo 'sudoers 未加载 sudoers.d，未执行安装。' >&2
+    exit 78
+fi
+for directory in /usr/local /usr/local/sbin /usr/local/libexec "$base" /etc/sudoers.d; do
+    [ ! -L "$directory" ] || { echo "refusing symbolic link: $directory" >&2; exit 78; }
+    if [ -e "$directory" ]; then
+        [ "$(stat -f '%u' "$directory")" = 0 ] || { echo "directory is not root-owned: $directory" >&2; exit 78; }
+        directory_mode=$(stat -f '%Lp' "$directory")
+        [ "$((0$directory_mode & 0022))" = 0 ] || { echo "directory is writable by other users: $directory" >&2; exit 78; }
+    else
+        /usr/bin/install -d -o root -g wheel -m 755 "$directory"
+    fi
+done
+
+stage=$(/usr/bin/mktemp -d "$base/.install-XXXXXXXX")
+/usr/bin/install -o root -g wheel -m 755 "$controller_source" "$stage/controller"
+/usr/bin/install -o root -g wheel -m 755 "$backend_source" "$stage/backend"
+/usr/bin/install -o root -g wheel -m 755 "$companion_source" "$stage/companion"
+/usr/bin/printf '%s ALL=(root) NOPASSWD: %s\n' "$target_user" "$controller_target" > "$stage/rule"
+/bin/chmod 440 "$stage/rule"
+/usr/sbin/visudo -cf "$stage/rule" >/dev/null
+
+project_dir=$(/usr/bin/sed -n '1p' "$script_dir/project-root.txt")
+[ -d "$project_dir" ] && [ ! -L "$project_dir" ] && [ -f "$project_dir/AGENTS.md" ] || exit 78
+backup="$project_dir/_RecycleBin/component-update-$(date '+%Y%m%d-%H%M%S')-$$"
+/bin/mkdir -p "$backup"
+success=0
+controller_changed=0
+backend_changed=0
+companion_changed=0
+rule_changed=0
+rollback() {
+    [ "$success" = 0 ] || return 0
+    for item in controller backend companion rule; do
+        case "$item" in
+            controller) target=$controller_target; changed=$controller_changed ;;
+            backend) target=$backend_target; changed=$backend_changed ;;
+            companion) target=$companion_target; changed=$companion_changed ;;
+            rule) target=$rule_target; changed=$rule_changed ;;
+        esac
+        if [ "$changed" = 1 ] && [ -e "$target" ]; then /bin/mv "$target" "$stage/$item.failed"; fi
+        if [ -e "$backup/$item" ] || [ -L "$backup/$item" ]; then /bin/mv "$backup/$item" "$target"; fi
+    done
+    echo "安装未完成，已尝试恢复旧文件；暂存与备份：$stage $backup" >&2
+}
+trap rollback EXIT
+trap 'exit 1' HUP INT TERM
+for item in controller backend companion rule; do
+    case "$item" in
+        controller) target=$controller_target ;;
+        backend) target=$backend_target ;;
+        companion) target=$companion_target ;;
+        rule) target=$rule_target ;;
+    esac
+    if [ -e "$target" ] || [ -L "$target" ]; then /bin/mv "$target" "$backup/$item"; fi
+    /bin/mv "$stage/$item" "$target"
+    case "$item" in controller) controller_changed=1 ;; backend) backend_changed=1 ;; companion) companion_changed=1 ;; rule) rule_changed=1 ;; esac
+done
+"$controller_target" permissions
+success=1
+echo "联网组件安装完成；旧版本文件保留在 $backup"
+echo '此次安装没有启动、停止或切换任何网络连接。'

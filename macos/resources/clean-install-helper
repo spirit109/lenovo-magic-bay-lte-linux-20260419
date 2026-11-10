@@ -1,0 +1,123 @@
+#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || exit 69
+[ "$#" = 2 ] || { [ "$#" = 3 ] && [ "$3" = --check ]; } || exit 64
+target_user=$1
+case "$target_user" in ''|*[!A-Za-z0-9._-]*) exit 64 ;; esac
+id "$target_user" >/dev/null
+project_dir=$(CDPATH= cd -- "$2" && pwd -P)
+test -f "$project_dir/AGENTS.md"
+test -f "$project_dir/backend/mbim_net.c"
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+contents_dir=$(dirname -- "$script_dir")
+app_dir=$(dirname -- "$contents_dir")
+test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$contents_dir/Info.plist")" = local.magicbay.lte.v2
+test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$contents_dir/Info.plist")" = 0.2.4
+for name in mbim-net magic-bay-lte-v2-rootctl magicbay-proxy-compat; do
+    test -x "$contents_dir/MacOS/$name"
+    /usr/bin/codesign --verify --strict "$contents_dir/MacOS/$name"
+done
+/usr/bin/codesign --verify --deep --strict "$app_dir"
+if [ "$#" = 3 ]; then
+    echo 'clean_install_preflight=ready version=0.2.4 network_started=0 files_changed=0'
+    exit 0
+fi
+[ "$(id -u)" = 0 ] || exit 77
+if /bin/ps -axo comm= | /usr/bin/awk '/\/(mbim-net|mbim-net-candidate|ncm-packet-trial|mbim-probe)$/ { found=1 } END { exit !found }'; then
+    echo '仍有联网或诊断后台，未执行清洁安装。' >&2; exit 75
+fi
+default_identity() { /sbin/route -n get default | /usr/bin/awk '/gateway:|interface:/ {print $2}'; }
+before=$(default_identity)
+home_iface=$(/sbin/route -n get default | /usr/bin/awk '/interface:/ {print $2}')
+home_gateway=$(/sbin/route -n get default | /usr/bin/awk '/gateway:/ {print $2}')
+case "$home_iface" in en[0-9]*) ;; *) echo '备用家庭网络未确认，未安装。' >&2; exit 75 ;; esac
+case "$home_gateway" in ''|*[!0-9.]*) exit 75 ;; esac
+/usr/bin/grep -Eq '^[#@]includedir[[:space:]]+(/private)?/etc/sudoers\.d' /etc/sudoers || exit 78
+for directory in /usr/local /usr/local/sbin /usr/local/libexec /etc/sudoers.d; do
+    [ -d "$directory" ] && [ ! -L "$directory" ] && [ "$(stat -f '%u' "$directory")" = 0 ] || exit 78
+    mode=$(stat -f '%Lp' "$directory")
+    [ "$((0$mode & 0022))" = 0 ] || exit 78
+done
+recycle="$project_dir/_RecycleBin"
+[ ! -L "$recycle" ] || exit 78
+/bin/mkdir -p "$recycle"
+backup="$recycle/clean-system-$(date '+%Y%m%d-%H%M%S')-$$"
+/bin/mkdir -m 755 "$backup"
+/bin/mkdir -m 700 "$backup/system" "$backup/failed"
+/bin/mkdir -m 755 "$backup/stage"
+stage="$backup/stage"
+for name in mbim-net magic-bay-lte-v2-rootctl magicbay-proxy-compat; do
+    /usr/bin/install -o root -g wheel -m 755 "$contents_dir/MacOS/$name" "$stage/$name"
+    /usr/bin/codesign --verify --strict "$stage/$name"
+done
+/usr/bin/printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/magic-bay-lte-v2-rootctl\n' "$target_user" > "$stage/rule"
+/bin/chmod 440 "$stage/rule"
+/usr/sbin/visudo -cf "$stage/rule" >/dev/null
+/usr/bin/printf '{"interface":"%s","gateway":"%s"}\n' "$home_iface" "$home_gateway" > "$stage/home-recovery.json"
+/bin/chmod 600 "$stage/home-recovery.json"
+proxy_exec=$(/bin/ps -axo uid=,comm= | /usr/bin/awk '$1 == 0 && /\/magicbay-proxy-compat$/ {sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); print}')
+if [ -n "$proxy_exec" ]; then
+    case "$proxy_exec" in
+        "$project_dir"/dist/proxy-compat-*/magicbay-proxy-compat|/usr/local/libexec/magic-bay-lte-v2/magicbay-proxy-compat) ;;
+        *) echo '兼容助手身份不在本项目范围，未终止。' >&2; exit 75 ;;
+    esac
+    "$script_dir/clean-stop-proxy" "$project_dir"
+fi
+target_for() {
+    case "$1" in
+        legacy-libexec) echo /usr/local/libexec/magic-bay-lte ;;
+        v2-libexec) echo /usr/local/libexec/magic-bay-lte-v2 ;;
+        legacy-controller) echo /usr/local/sbin/magic-bay-lte-rootctl ;;
+        v2-controller) echo /usr/local/sbin/magic-bay-lte-v2-rootctl ;;
+        legacy-rule) echo /etc/sudoers.d/magic-bay-lte ;;
+        v2-rule) echo /etc/sudoers.d/magic-bay-lte-v2 ;;
+        legacy-runtime) echo /var/run/magic-bay-lte ;;
+        v2-runtime) echo /var/run/magic-bay-lte-v2 ;;
+    esac
+}
+items='legacy-libexec v2-libexec legacy-controller v2-controller legacy-rule v2-rule legacy-runtime v2-runtime'
+for item in $items; do
+    target=$(target_for "$item")
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        [ ! -L "$target" ] && [ "$(stat -f '%u' "$target")" = 0 ] || exit 78
+        [ "$(stat -f '%d' "$target")" = "$(stat -f '%d' "$backup")" ] || exit 78
+    fi
+done
+success=0
+started=0
+rollback() {
+    [ "$success" = 0 ] && [ "$started" = 1 ] || return 0
+    for item in $items; do
+        target=$(target_for "$item")
+        if [ -e "$backup/system/$item" ]; then
+            if [ -e "$target" ]; then /bin/mv "$target" "$backup/failed/$item"; fi
+            /bin/mv "$backup/system/$item" "$target"
+        fi
+    done
+    if [ -n "$proxy_exec" ] && [ -x "$proxy_exec" ]; then "$proxy_exec" start || true; fi
+    echo "清洁安装未完成，原组件已尝试恢复；备份 $backup" >&2
+}
+trap rollback EXIT
+trap 'exit 1' HUP INT TERM
+started=1
+for item in $items; do
+    target=$(target_for "$item")
+    if [ -e "$target" ]; then /bin/mv "$target" "$backup/system/$item"; fi
+done
+/usr/bin/install -d -o root -g wheel -m 755 /usr/local/libexec/magic-bay-lte-v2 /var/run/magic-bay-lte-v2
+/usr/bin/install -o root -g wheel -m 600 /dev/null /var/run/magic-bay-lte-v2/control.lock
+for name in mbim-net magicbay-proxy-compat; do
+    /bin/mv "$stage/$name" "/usr/local/libexec/magic-bay-lte-v2/$name"
+done
+/bin/mv "$stage/magic-bay-lte-v2-rootctl" /usr/local/sbin/magic-bay-lte-v2-rootctl
+/bin/mv "$stage/rule" /etc/sudoers.d/magic-bay-lte-v2
+/bin/mv "$stage/home-recovery.json" /usr/local/libexec/magic-bay-lte-v2/home-recovery.json
+/usr/sbin/visudo -cf /etc/sudoers >/dev/null
+/usr/local/sbin/magic-bay-lte-v2-rootctl version
+/usr/bin/sudo -u "$target_user" /usr/bin/sudo -n /usr/local/sbin/magic-bay-lte-v2-rootctl permissions
+[ "$(default_identity)" = "$before" ]
+success=1
+echo "clean_install=1 version=0.2.4 backup=$backup"
+echo 'legacy_components_removed=1 runtime_reset=1 network_started=0'

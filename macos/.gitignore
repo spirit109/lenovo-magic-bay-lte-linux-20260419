@@ -1,0 +1,7 @@
+dist/
+dependencies/
+tests/run-*/
+_RecycleBin/
+__pycache__/
+*.py[cod]
+.DS_Store
